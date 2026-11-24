@@ -14,7 +14,7 @@ const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = se
    ===================================================================== */
 const DB_KEY = 'ingeta_app_v3';
 const SESSION_KEY = 'ingeta_session_v3';
-let DATA = { posts: [], categories: [], userMap: {}, synced: '' };
+let DATA = { posts: [], categories: [], themeMap: null, userMap: {}, synced: '' };
 let PODS = [];
 
 const SERIES = [
@@ -22,7 +22,11 @@ const SERIES = [
   { name: 'L’Étrange guerre', desc: 'Conversations avec Jean-Pierre Mbelu', img: 'assets/img/etrange-guerre.jpg' },
   { name: 'Demain Le Congo', desc: 'Réinventer le Congo avec Jean-Pierre Mbelu', img: 'assets/img/ingeta-podcast.jpg' },
 ];
-function themeOf(catId) { const c = DATA.categories.find(x => x.id === catId); return c ? c.name : 'Analyses & commentaires'; }
+function themeOf(catId) {
+  if (DATA.themeMap && DATA.themeMap[catId]) return DATA.themeMap[catId];
+  const c = DATA.categories.find(x => x.id === catId);
+  return c ? c.name : 'Analyses & commentaires';
+}
 function catsOf(p) { const names = (p.categories || []).map(themeOf).filter(n => n && n !== 'Non classé'); return names.length ? names : ['Analyses & commentaires']; }
 function readMin(p) { const words = strip(p.excerpt || '').split(/\s+/).length + 120; return Math.max(2, Math.round(words / 180)); }
 function authorOf(p) { const t = strip(p.authorName || ''); return t || 'Ingeta'; }
@@ -65,7 +69,15 @@ let DB = loadDB();
 function saveDB() { try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { console.warn('stockage plein', e); } }
 function session() { try { return localStorage.getItem(SESSION_KEY); } catch (e) { return null; } }
 function setSession(id) { try { id ? localStorage.setItem(SESSION_KEY, id) : localStorage.removeItem(SESSION_KEY); } catch (e) {} }
-function me() { const id = session(); return id ? DB.users.find(u => u.id === id) : null; }
+function me() {
+  /* En mode Supabase, l'utilisateur vient de Store ; en mode local, du stockage. */
+  if (Store.mode === 'supabase') {
+    const p = Store.user; if (!p) return null;
+    return { id: p.id, name: p.full_name, email: p.email, region: p.region,
+             role: p.role, created: p.created_at };
+  }
+  const id = session(); return id ? DB.users.find(u => u.id === id) : null;
+}
 
 /* =====================================================================
    CHARGEMENT DES CONTENUS RÉELS
@@ -83,7 +95,7 @@ async function loadContent() {
     PODS = (pods || []).map(e => ({ ...e, title: dec(e.title || ''), series: dec(e.series || '') }));
     // auteurs réels : la signature en tête du contenu
     const STOP = /^(tandis|aujourd|aujourd’hui|hier|demain|depuis|lorsque|pourtant|cependant|néanmoins|toutefois|car|donc|or|ni|voici|voilà|on|dans|en|le|la|les|un|une|des|du|de|au|aux|il|elle|nous|vous|ils|elles|ce|cet|cette|ces|qui|que|quoi|pour|par|avec|sans|sur|sous|mais|ou|et|si|comme|quand|depuis|après|avant|alors|ainsi|toutefois|pourtant|cependant|je|tu|mon|ma|mes|notre|nos|leur|leurs|son|sa|ses|the|by|and|in|of|a|an|is|are|was|were|to|for|with|from|this|that|these|those|it|its|as|at|be|been|has|have|had|will|would|can|could|should|may|might|must|do|does|did|not|no|so|if|or|but|we|they|he|she|i|you|them|his|her|our|your|my)\b/i;
-    DATA.posts.forEach(p => {
+    if (Store.mode !== 'supabase') DATA.posts.forEach(p => {
       const txt = strip(p.excerpt || '');
       const m = txt.match(/^(?:Par|By)\s+([A-ZÀ-Ÿ][\w’'’-]+(?:\s+[A-ZÀ-Ÿ][\w’'’-]+){0,3})/);
       let name = m ? m[1] : 'Ingeta';
@@ -100,6 +112,53 @@ async function loadContent() {
 }
 
 /* =====================================================================
+   CHARGEMENT DU CONTENU DEPUIS SUPABASE
+   ===================================================================== */
+let SB_PAGE = 1, SB_TOTAL = 0, SB_QUERY = { search: '', themeId: null, sort: 'recent' };
+
+async function loadContentFromSupabase() {
+  try {
+    const [thematics, episodes, first] = await Promise.all([
+      Store.listThematics(),
+      Store.listEpisodes(),
+      Store.listArticles({ page: 1, per: 24 })
+    ]);
+    DATA.categories = thematics.map(t => ({ id: t.id, name: t.name, slug: t.slug, count: t.count }));
+    DATA.themeMap = Object.fromEntries(thematics.map(t => [t.id, t.name]));
+    PODS = episodes;
+    SB_TOTAL = first.total;
+    DATA.posts = projectPosts(first.posts);
+    DATA.synced = new Date().toISOString();
+    SB_PAGE = 1;
+    return true;
+  } catch (e) {
+    console.error('Supabase : chargement impossible', e);
+    toast('⚠️ Connexion aux données impossible — vérifiez votre configuration');
+    return false;
+  }
+}
+
+/* Les lignes Supabase prennent la forme attendue par l'interface. */
+function projectPosts(rows) {
+  return rows.map(r => ({
+    id: Number(r.id), title: r.title, excerpt: r.excerpt || '',
+    image: r.image, date: r.date || r.published_at, link: r.link || r.source_url,
+    categories: r.theme_ids || r.categories || [], sh: null,
+    authorName: 'Ingeta'
+  }));
+}
+
+/* Recharge une page d'articles depuis la base (recherche, thème, tri). */
+async function loadArticlePage(page, { search, themeId, sort } = {}) {
+  SB_QUERY = { search: search ?? SB_QUERY.search, themeId: themeId === undefined ? SB_QUERY.themeId : themeId, sort: sort || SB_QUERY.sort };
+  const res = await Store.listArticles({ ...SB_QUERY, page, per: 24 });
+  SB_TOTAL = res.total;
+  SB_PAGE = page;
+  DATA.posts = page === 1 ? projectPosts(res.posts) : DATA.posts.concat(projectPosts(res.posts));
+  return res.total;
+}
+
+/* =====================================================================
    APPLICATION
    ===================================================================== */
 const App = {
@@ -110,17 +169,122 @@ const App = {
 
   /* ---------- INIT ---------- */
   async boot() {
-    const ok = await loadContent();
-    if (!ok) { $('#bootErr').classList.remove('hidden'); }
-    this.dark = !!DB.dark; document.body.classList.toggle('dark', this.dark);
+    const st = await Store.init();
+    Store.mode = st.mode;
+    if (Store.mode === 'supabase') {
+      $('#bootMsg').textContent = 'Connexion à la base de données…';
+      await loadContentFromSupabase();
+      if (Store.user) await Store.hydrate();
+    } else {
+      const ok = await loadContent();
+      if (!ok) $('#bootErr').classList.remove('hidden');
+    }
+    this.dark = Store.mode === 'supabase' ? false : !!DB.dark;
+    document.body.classList.toggle('dark', this.dark);
+    this.updateModeBadge();
+    this.paintAuthMode();
+    const demoBtn = $('#demoBox button');
+    if (Store.mode === 'supabase' && demoBtn) demoBtn.remove();
+    if (Store.mode === 'supabase') {
+      $('#demoBox').innerHTML = '<b>Comptes réels</b><br>Créez votre compte avec le formulaire ci-dessus. '
+        + 'Une confirmation par e-mail peut être demandée selon les réglages de votre projet Supabase.';
+    }
     const u = me();
     if (u && DATA.posts.length) { this.enterApp(); }
-    else { $('#authScreen').classList.remove('hidden'); $('#bootScreen').classList.add('hidden'); }
+    else if (location.hash.startsWith('#article-')) {
+      /* Lien profond vers un article : lecture directe, sans compte. */
+      const id = Number(location.hash.replace('#article-', ''));
+      $('#bootScreen').classList.add('hidden');
+      await Pub.show();
+      if (id) Pub.open(id);
+    }
+    else if (this.wantsMemberSpace()) { $('#authScreen').classList.remove('hidden'); $('#bootScreen').classList.add('hidden'); }
+    else { $('#bootScreen').classList.add('hidden'); Pub.show(); }
+  },
+
+  /* L'écran d'authentification n'apparaît que si l'utilisateur le demande. */
+  wantsMemberSpace() { return location.hash.startsWith('#connexion') || location.hash.startsWith('#inscription'); },
+
+  openAuth(tab) {
+    $('#publicApp').classList.add('hidden');
+    $('#app').classList.add('hidden');
+    $('#authScreen').classList.remove('hidden');
+    if (tab) this.setAuthTab(tab);
+    history.replaceState(null, '', tab === 'signup' ? '#inscription' : '#connexion');
+  },
+
+  /* Retour au portail public, sans perdre la session. */
+  async backToPublic() {
+    $('#authScreen').classList.add('hidden');
+    $('#app').classList.add('hidden');
+    history.replaceState(null, '', '#accueil');
+    await Pub.show();
+  },
+
+  /* Depuis le portail : ouvre l'espace personnel (ou la connexion). */
+  openMemberSpace() {
+    if (Store.user) { this.enterApp(); } else { this.openAuth('login'); }
+  },
+
+  /* Recherche du portail public. */
+  pubSearch(e) {
+    if (e) e.preventDefault();
+    const q = ($('#pubSearchInput') || {}).value || '';
+    Pub.query = q; Pub.view = 'recherche';
+    Pub.render();
+    return false;
+  },
+
+  /* Délégué vers le portail public. */
+  pubGo(view) { Pub.go(view); },
+
+  pubToggleNotifs(ev) {
+    if (ev) ev.stopPropagation();
+    if (!Store.user) { this.openAuth('signup'); return; }
+    this.go('settings');
+  },
+  paintAuthMode() {
+    const el = $('#authMode'); if (!el) return;
+    el.innerHTML = Store.mode === 'supabase'
+      ? '<span style="display:inline-flex;align-items:center;gap:5px;background:rgba(34,197,94,.12);color:#15803d;padding:3px 9px;border-radius:99px;font-weight:800;font-size:10.5px">● Connecté à Supabase</span><br>Vos lectures, notes et collections sont synchronisées entre vos appareils.'
+      : '<span style="display:inline-flex;align-items:center;gap:5px;background:var(--cream);padding:3px 9px;border-radius:99px;font-weight:800;font-size:10.5px">Mode local</span><br>Les données restent dans ce navigateur.';
+  },
+  updateModeBadge() {
+    const el = $('#modeBadge'); if (!el) return;
+    if (Store.mode === 'supabase') {
+      el.innerHTML = '<span style="width:6px;height:6px;border-radius:50%;background:#22c55e;display:inline-block"></span> Synchronisé';
+      el.title = 'Données stockées dans Supabase et synchronisées entre vos appareils';
+      el.style.background = 'rgba(34,197,94,.14)'; el.style.color = '#15803d';
+    } else {
+      el.innerHTML = 'Mode local';
+      el.title = 'Données stockées dans ce navigateur — ajoutez vos clés Supabase dans config.js pour synchroniser';
+      el.style.background = 'rgba(255,255,255,.12)'; el.style.color = 'rgba(255,255,255,.7)';
+    }
   },
   enterApp() {
     $('#authScreen').classList.add('hidden'); $('#bootScreen').classList.add('hidden');
+    if (window.Pub) Pub.hide();
     $('#app').classList.remove('hidden');
-    this.renderShell(); this.go('dashboard');
+    this.renderShell();
+    /* Raccourcis PWA et liens directs : index.html#notes, #articles, #podcasts… */
+    const dest = (location.hash || '').replace('#', '');
+    const valid = ['dashboard', 'articles', 'podcasts', 'themes', 'saved', 'collections', 'notes', 'discussions', 'events', 'admin', 'settings'];
+    this.go(valid.includes(dest) ? dest : 'dashboard');
+    /* Temps réel : les discussions et événements se rafraîchissent seuls. */
+    if (Store.mode === 'supabase' && !this._rt) {
+      this._rt = Store.subscribeCommunity(() => {
+        if (['discussions', 'events'].includes(this.view)) this.render();
+      });
+    }
+  },
+  async forgotPassword() {
+    if (Store.mode !== 'supabase') { toast('La réinitialisation nécessite Supabase. Mode local : utilisez le compte démo.'); return; }
+    const email = $('#fEmail').value.trim().toLowerCase();
+    if (!email) return this.authErr('Saisissez d’abord votre adresse e-mail, puis cliquez sur « Mot de passe oublié ».');
+    try {
+      await Store.resetPassword(email);
+      $('#authErr').innerHTML = '<div class="err" style="background:var(--blue-l);color:var(--blue);border-color:#bcdcff">✉️ Un lien de réinitialisation a été envoyé à ' + esc(email) + '.</div>';
+    } catch (e) { this.authErr(e.message); }
   },
   setAuthTab(t) {
     this.authTab = t;
@@ -134,9 +298,40 @@ const App = {
     $('#authErr').innerHTML = '';
   },
   authErr(m) { $('#authErr').innerHTML = '<div class="err">⚠️ ' + esc(m) + '</div>'; return false; },
-  submitAuth(e) {
+  async submitAuth(e) {
     e.preventDefault(); $('#authErr').innerHTML = '';
     const email = $('#fEmail').value.trim().toLowerCase(), pass = $('#fPass').value;
+
+    /* ---- Mode Supabase : authentification réelle ---- */
+    if (Store.mode === 'supabase') {
+      const btn = $('#authBtn'); const label = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Veuillez patienter…';
+      try {
+        if (this.authTab === 'register') {
+          const name = $('#fName').value.trim(), region = $('#fRegion').value;
+          if (name.length < 2) { btn.disabled = false; btn.textContent = label; return this.authErr('Veuillez saisir votre nom complet.'); }
+          if (pass.length < 6) { btn.disabled = false; btn.textContent = label; return this.authErr('Le mot de passe doit contenir au moins 6 caractères.'); }
+          const res = await Store.signUp({ email, password: pass, fullName: name, region });
+          if (res.needsConfirmation) {
+            btn.disabled = false; btn.textContent = label;
+            $('#authErr').innerHTML = '<div class="err" style="background:var(--blue-l);color:var(--blue);border-color:#bcdcff">✉️ Compte créé. Vérifiez votre boîte mail : cliquez sur le lien de confirmation, puis connectez-vous.</div>';
+            return false;
+          }
+          this.region = region; this.enterApp(); toast('🎉 Bienvenue sur Ingeta, ' + name.split(' ')[0] + ' !');
+          return false;
+        }
+        await Store.signIn(email, pass);
+        this.region = Store.user.region; this.enterApp();
+        toast('👋 Bon retour, ' + Store.user.full_name.split(' ')[0] + ' !');
+      } catch (err) {
+        btn.disabled = false; btn.textContent = label;
+        return this.authErr(err.message);
+      }
+      btn.disabled = false; btn.textContent = label;
+      return false;
+    }
+
+    /* ---- Mode local ---- */
     if (this.authTab === 'register') {
       const name = $('#fName').value.trim(), region = $('#fRegion').value;
       if (name.length < 2) return this.authErr('Veuillez saisir votre nom complet.');
@@ -152,8 +347,16 @@ const App = {
     }
     return false;
   },
-  demoLogin() { const u = DB.users.find(u => u.id === 'u_demo'); setSession(u.id); this.enterApp(); toast('👋 Connecté en démo — Aline Nsimba'); },
-  logout() { setSession(null); location.reload(); },
+  async demoLogin() {
+    if (Store.mode === 'supabase') {
+      const box = $('#demoBox');
+      box.innerHTML = '<div style="font-size:12px;line-height:1.6"><b>Mode Supabase actif</b><br>Créez votre compte avec le formulaire ci-dessus. Le premier inscrit peut devenir administrateur (voir README).</div>';
+      return;
+    }
+    const u = DB.users.find(u => u.id === 'u_demo');
+    setSession(u.id); this.enterApp(); toast('👋 Connecté en démo — Aline Nsimba');
+  },
+  async logout() { await Store.signOut(); setSession(null); location.reload(); },
 
   /* ---------- SHELL ---------- */
   renderShell() {
@@ -162,7 +365,7 @@ const App = {
     $('#sideName').textContent = u.name;
     $('#sideRegion').textContent = u.region + (u.role === 'admin' ? ' · Admin' : '');
     $('#sideAvatar').textContent = initials(u.name); $('#topAvatar').textContent = initials(u.name);
-    const savedN = (DB.saved[u.id] || []).length;
+    const savedN = Store.mode === 'supabase' ? Store.saved.size : (DB.saved[u.id] || []).length;
     const nav = [
       { sec: 'Découvrir' },
       { id: 'dashboard', icon: '🏠', label: 'Tableau de bord' },
@@ -189,17 +392,32 @@ const App = {
   closeSidebar() { $('#sidebar').classList.remove('open'); $('#overlay').classList.remove('show'); },
   toggleNotifs(e) { e.stopPropagation(); this.notifOpen = !this.notifOpen; $('#notifPanel').classList.toggle('hidden', !this.notifOpen); },
   toggleDark() { this.dark = !this.dark; DB.dark = this.dark; saveDB(); document.body.classList.toggle('dark', this.dark); toast(this.dark ? '🌙 Mode sombre activé' : '☀️ Mode clair activé'); },
-  onSearch(v) { this.q = v.trim().toLowerCase(); if (!['articles', 'themes'].includes(this.view)) this.go('articles', true); else { this.page = 1; this.render(); } },
+  onSearch(v) {
+    this.q = v.trim().toLowerCase();
+    this.page = 1; this._lastQuery = null;
+    if (!['articles', 'themes'].includes(this.view)) this.go('articles', true);
+    else { clearTimeout(this._searchT); this._searchT = setTimeout(() => this.render(), 320); }
+  },
   go(view) {
     this.view = view; this.closeSidebar(); this.notifOpen = false; $('#notifPanel').classList.add('hidden');
+    /* Le hash suit la vue : liens partageables et raccourcis d'écran d'accueil. */
+    if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view);
     this.renderShell(); this.render(true); window.scrollTo({ top: 0 });
   },
   render(loading) {
     const v = $('#view');
     if (loading) v.innerHTML = '<div class="grid grid-3">' + '<div class="skeleton sk-card"></div>'.repeat(3) + '</div><div class="skeleton" style="height:120px;margin-top:16px"></div>';
-    setTimeout(() => {
+    setTimeout(async () => {
       const fn = { dashboard: this.vDashboard, articles: this.vArticles, podcasts: this.vPodcasts, themes: this.vThemes, saved: this.vSaved, collections: this.vCollections, notes: this.vNotes, discussions: this.vDiscussions, events: this.vEvents, admin: this.vAdmin, settings: this.vSettings }[this.view];
-      v.innerHTML = fn ? fn.call(this) : '';
+      if (!fn) { v.innerHTML = ''; return; }
+      try {
+        const out = fn.call(this);
+        v.innerHTML = out && typeof out.then === 'function' ? await out : out;
+      } catch (e) {
+        console.error(e);
+        v.innerHTML = '<div class="empty"><div class="art">⚠️</div><h4>Chargement impossible</h4><p>'
+          + esc(e.message || 'Erreur inconnue') + '</p><button class="btn btn-primary" style="width:auto" onclick="App.render(true)">Réessayer</button></div>';
+      }
     }, loading ? 260 : 0);
   },
 
@@ -209,8 +427,7 @@ const App = {
     return '';
   },
   artCard(p) {
-    const u = me(), saved = (DB.saved[u.id] || []).includes(p.id), liked = (DB.liked[u.id] || []).includes(p.id);
-    const prog = (DB.progress[u.id] || {})[p.id] || 0;
+    const saved = this.isSaved(p.id), liked = this.isLiked(p.id), prog = this.progressOf(p.id);
     const cats = catsOf(p);
     const noImg = !p.image;
     return '<article class="card" onclick="App.openArticle(' + p.id + ')">'
@@ -231,25 +448,69 @@ const App = {
   postById(id) { return DATA.posts.find(p => p.id === Number(id)); },
 
   /* ---------- ACTIONS (optimistes) ---------- */
-  toggleLike(id) {
-    const u = me(); DB.liked[u.id] = DB.liked[u.id] || []; const i = DB.liked[u.id].indexOf(id);
+  async toggleLike(id) {
+    const u = me();
+    /* Mode Supabase : mise à jour optimiste, puis écriture en base (rollback si échec). */
+    if (Store.mode === 'supabase') {
+      const on = !Store.liked.has(Number(id));
+      on ? Store.liked.add(Number(id)) : Store.liked.delete(Number(id));
+      this.renderShell(); this.render();
+      if (this.readerPost && this.readerPost.id === id) this.openArticle(id, true);
+      try {
+        await Store.toggleLiked(id, on);
+        toast(on ? '♥ Ajouté à vos coups de cœur' : 'Retiré de vos coups de cœur');
+      } catch (e) {
+        on ? Store.liked.delete(Number(id)) : Store.liked.add(Number(id));
+        this.renderShell(); this.render(); toast('⚠️ ' + e.message);
+      }
+      return;
+    }
+    DB.liked[u.id] = DB.liked[u.id] || []; const i = DB.liked[u.id].indexOf(id);
     if (i >= 0) DB.liked[u.id].splice(i, 1); else { DB.liked[u.id].push(id); toast('♥ Ajouté à vos coups de cœur'); }
     saveDB(); this.renderShell(); this.render();
     if (this.readerPost && this.readerPost.id === id) this.openArticle(id, true);
   },
-  toggleSave(id) {
-    const u = me(); DB.saved[u.id] = DB.saved[u.id] || []; const i = DB.saved[u.id].indexOf(id);
+  async toggleSave(id) {
+    const u = me();
+    if (Store.mode === 'supabase') {
+      const on = !Store.saved.has(Number(id));
+      on ? Store.saved.add(Number(id)) : Store.saved.delete(Number(id));
+      this.renderShell(); this.render();
+      if (this.readerPost && this.readerPost.id === id) this.openArticle(id, true);
+      try {
+        await Store.toggleSaved(id, on);
+        toast(on ? '🔖 Enregistré — retrouvez-le dans « Enregistrés »' : '🔖 Retiré des enregistrés');
+      } catch (e) {
+        on ? Store.saved.delete(Number(id)) : Store.saved.add(Number(id));
+        this.renderShell(); this.render(); toast('⚠️ ' + e.message);
+      }
+      return;
+    }
+    DB.saved[u.id] = DB.saved[u.id] || []; const i = DB.saved[u.id].indexOf(id);
     if (i >= 0) { DB.saved[u.id].splice(i, 1); toast('🔖 Retiré des enregistrés'); }
     else { DB.saved[u.id].push(id); toast('🔖 Enregistré — retrouvez-le dans « Enregistrés »'); }
     saveDB(); this.renderShell(); this.render();
     if (this.readerPost && this.readerPost.id === id) this.openArticle(id, true);
   },
+  /* Statut d'un article, quel que soit le mode. */
+  isSaved(id) { return Store.mode === 'supabase' ? Store.saved.has(Number(id)) : (DB.saved[me().id] || []).includes(id); },
+  isLiked(id) { return Store.mode === 'supabase' ? Store.liked.has(Number(id)) : (DB.liked[me().id] || []).includes(id); },
+  progressOf(id) { return Store.mode === 'supabase' ? (Store.progress[Number(id)] || 0) : ((DB.progress[me().id] || {})[id] || 0); },
 
   /* ---------- DASHBOARD ---------- */
-  vDashboard() {
+  async vDashboard() {
     const u = me();
-    const savedN = (DB.saved[u.id] || []).length, notesN = DB.notes.filter(n => n.owner === u.id).length;
-    const readN = Object.keys(DB.progress[u.id] || {}).length;
+    let savedN, notesN, readN, colsN;
+    if (Store.mode === 'supabase') {
+      let counts = { saved: Store.saved.size, notes: 0, collections: 0, started: Object.keys(Store.progress).length };
+      try { counts = await Store.dashboardCounts(); } catch (e) { /* compteurs secondaires */ }
+      savedN = counts.saved; notesN = counts.notes; readN = counts.started; colsN = counts.collections;
+    } else {
+      savedN = (DB.saved[u.id] || []).length;
+      notesN = DB.notes.filter(n => n.owner === u.id).length;
+      readN = Object.keys(DB.progress[u.id] || {}).length;
+      colsN = DB.collections.filter(c => c.owner === u.id).length;
+    }
     const recent = [...DATA.posts].sort((a, b) => new Date(b.date) - new Date(a.date));
     const featured = recent.slice(0, 6);
     const topics = DATA.categories.filter(c => c.count > 30).slice(0, 6);
@@ -276,7 +537,7 @@ const App = {
       + '<div class="stat"><div class="num">' + (savedN || 0) + '</div><div class="lbl">Articles enregistrés</div><span class="delta">🔖 Votre bibliothèque</span></div>'
       + '<div class="stat"><div class="num">' + readN + '</div><div class="lbl">Articles commencés</div><span class="delta">📖 Progression suivie</span></div>'
       + '<div class="stat"><div class="num">' + notesN + '</div><div class="lbl">Notes personnelles</div><span class="delta">📝 Espace privé</span></div>'
-      + '<div class="stat"><div class="num">' + DB.collections.filter(c => c.owner === u.id).length + '</div><div class="lbl">Collections</div><span class="delta">🗂️ Organisées</span></div>'
+      + '<div class="stat"><div class="num">' + colsN + '</div><div class="lbl">Collections</div><span class="delta">🗂️ Organisées</span></div>'
       + '</div>'
       + '<div class="idea"><div class="ico">💡</div><div><div class="q">' + idea[0] + '</div><div class="by">— ' + idea[1].toUpperCase() + '</div></div></div>'
       + '<div class="split"><div>'
@@ -307,7 +568,34 @@ const App = {
     else if (this.sort === 'az') list = [...list].sort((a, b) => strip(a.title).localeCompare(strip(b.title), 'fr'));
     return list;
   },
-  vArticles() {
+  async vArticles() {
+    /* ---- Mode Supabase : la base filtre, trie et pagine ---- */
+    if (Store.mode === 'supabase') {
+      let total = SB_TOTAL;
+      const firstLoad = this._lastQuery !== JSON.stringify([this.q, this.catFilter, this.sort]);
+      if (firstLoad) {
+        try {
+          total = await loadArticlePage(1, { search: this.q, themeId: this.catFilter, sort: this.sort });
+          this.page = 1;
+          this._lastQuery = JSON.stringify([this.q, this.catFilter, this.sort]);
+        } catch (e) { toast('⚠️ ' + e.message); }
+      } else {
+        total = SB_TOTAL;
+      }
+      const shown = DATA.posts;
+      const cats = DATA.categories.slice(0, 14);
+      return '<div class="section-head"><div><h3>Articles</h3><p>' + total.toLocaleString('fr-FR') + ' article(s) — contenus authentiques d’ingeta.com, libres d’accès.</p></div>'
+        + '<button class="pill" onclick="App.go(\'themes\')">Voir par thématique →</button></div>'
+        + '<div class="filter-bar"><div class="scroll-x" style="flex:1;min-width:0">'
+        + '<button class="chip ' + (!this.catFilter ? 'on' : '') + '" onclick="App.setCat(null)">Toutes</button>'
+        + cats.map(c => '<button class="chip ' + (this.catFilter === c.id ? 'on' : '') + '" onclick="App.setCat(' + c.id + ')">' + esc(c.name) + ' <span style="opacity:.65">' + c.count + '</span></button>').join('')
+        + '</div><select onchange="App.sort=this.value;App._lastQuery=null;App.render()"><option value="recent" ' + (this.sort === 'recent' ? 'selected' : '') + '>Plus récents</option><option value="old" ' + (this.sort === 'old' ? 'selected' : '') + '>Plus anciens</option><option value="az" ' + (this.sort === 'az' ? 'selected' : '') + '>A → Z</option></select></div>'
+        + (shown.length ? '<div class="grid grid-3">' + shown.map(p => this.artCard(p)).join('') + '</div>'
+          + (total > shown.length ? '<div style="text-align:center;margin-top:22px"><button class="btn btn-outline" style="width:auto" onclick="App.loadMore()" id="moreBtn">Charger plus (' + (total - shown.length).toLocaleString('fr-FR') + ' restants)</button></div>' : '')
+          : this.empty('🔎', 'Aucun article trouvé', 'Essayez un autre mot-clé ou retirez les filtres actifs.', 'Réinitialiser', "App.q='';App.catFilter=null;App._lastQuery=null;App.render()"));
+    }
+
+    /* ---- Mode local ---- */
     const all = this.filteredPosts();
     const shown = all.slice(0, this.page * this.per);
     const cats = DATA.categories.filter(c => c.count > 0).slice(0, 14);
@@ -321,8 +609,23 @@ const App = {
         + (all.length > shown.length ? '<div style="text-align:center;margin-top:22px"><button class="btn btn-outline" style="width:auto" onclick="App.page++;App.render()">Charger plus (' + (all.length - shown.length).toLocaleString('fr-FR') + ' restants)</button></div>' : '')
         : this.empty('🔎', 'Aucun article trouvé', 'Essayez un autre mot-clé ou retirez les filtres actifs.', 'Réinitialiser', "App.q='';App.catFilter=null;App.render()"));
   },
-  setCat(id) { this.catFilter = id; this.page = 1; this.render(); },
-  openTheme(id) { this.catFilter = id; this.view = 'articles'; this.page = 1; this.renderShell(); this.render(true); window.scrollTo({ top: 0 }); },
+  async loadMore() {
+    const btn = $('#moreBtn'); if (btn) { btn.disabled = true; btn.textContent = 'Chargement…'; }
+    try {
+      await loadArticlePage(SB_PAGE + 1);
+      this.page = SB_PAGE;
+      const wrap = $('#view .grid');
+      const before = wrap.children.length;
+      wrap.insertAdjacentHTML('beforeend', DATA.posts.slice(before).map(p => this.artCard(p)).join(''));
+      const remaining = SB_TOTAL - DATA.posts.length;
+      if (btn) {
+        if (remaining > 0) { btn.disabled = false; btn.textContent = 'Charger plus (' + remaining.toLocaleString('fr-FR') + ' restants)'; }
+        else btn.parentElement.remove();
+      }
+    } catch (e) { toast('⚠️ ' + e.message); if (btn) { btn.disabled = false; btn.textContent = 'Réessayer'; } }
+  },
+  setCat(id) { this.catFilter = id; this.page = 1; this._lastQuery = null; this.render(); },
+  openTheme(id) { this.catFilter = id; this.view = 'articles'; this.page = 1; this._lastQuery = null; this.renderShell(); this.render(true); window.scrollTo({ top: 0 }); },
 
   /* ---------- THÈMES ---------- */
   vThemes() {
@@ -399,7 +702,7 @@ const App = {
 
   /* ---------- ENREGISTRÉS ---------- */
   vSaved() {
-    const u = me(), ids = (DB.saved[u.id] || []);
+    const ids = Store.mode === 'supabase' ? [...Store.saved] : (DB.saved[me().id] || []);
     const posts = ids.map(id => this.postById(id)).filter(Boolean);
     return '<div class="section-head"><div><h3>Enregistrés</h3><p>' + posts.length + ' article(s) dans votre bibliothèque personnelle.</p></div></div>'
       + (posts.length ? '<div class="grid grid-3">' + posts.map(p => this.artCard(p)).join('') + '</div>'
@@ -407,9 +710,19 @@ const App = {
   },
 
   /* ---------- COLLECTIONS ---------- */
-  vCollections() {
+  async vCollections() {
+    if (Store.mode === 'supabase') {
+      let cols = [];
+      try { cols = await Store.listCollections(); } catch (e) { toast('⚠️ ' + e.message); }
+      this._cols = cols;
+      if (this.collId) return this.renderCollectionDetail(cols.find(c => c.id === this.collId));
+      return this.renderCollections(cols);
+    }
     const u = me(), cols = DB.collections.filter(c => c.owner === u.id);
     if (this.collId) return this.vCollectionDetail();
+    return this.renderCollections(cols);
+  },
+  renderCollections(cols) {
     return '<div class="section-head"><div><h3>Collections</h3><p>Organisez les articles d’Ingeta en parcours de lecture.</p></div><button class="btn btn-primary btn-sm" style="width:auto" onclick="App.openCollectionForm()">+ Nouvelle collection</button></div>'
       + (cols.length ? '<div class="grid grid-3">' + cols.map(c => {
         const ps = c.postIds.map(id => this.postById(id)).filter(Boolean);
@@ -422,8 +735,15 @@ const App = {
         : this.empty('🗂️', 'Aucune collection', 'Créez des parcours de lecture : « Comprendre la guerre », « Réinventer le Congo », vos propres thèmes…', '+ Créer ma première collection', 'App.openCollectionForm()'));
   },
   openCollection(id) { this.collId = id; this.render(true); window.scrollTo({ top: 0 }); },
-  vCollectionDetail() {
-    const c = DB.collections.find(x => x.id === this.collId); if (!c) { this.collId = null; return this.vCollections(); }
+  async vCollectionDetail() {
+    if (Store.mode === 'supabase') {
+      const cols = this._cols || await Store.listCollections();
+      return this.renderCollectionDetail(cols.find(c => c.id === this.collId));
+    }
+    return this.renderCollectionDetail(DB.collections.find(x => x.id === this.collId));
+  },
+  renderCollectionDetail(c) {
+    if (!c) { this.collId = null; return this.vCollections(); }
     const posts = c.postIds.map(id => this.postById(id)).filter(Boolean);
     return '<button class="pill" onclick="App.collId=null;App.render()">← Toutes les collections</button>'
       + '<div class="section-head" style="margin-top:14px"><div><h3>' + esc(c.name) + '</h3><p>' + esc(c.desc || '') + '</p></div>'
@@ -439,8 +759,17 @@ const App = {
       + '<div class="field"><label>Description</label><textarea id="cDesc" placeholder="De quoi parle ce parcours de lecture ?">' + esc(c ? c.desc || '' : '') + '</textarea></div>'
       + '<div class="modal-actions"><button type="button" class="btn btn-outline" onclick="App.closeModal()">Annuler</button><button type="submit" class="btn btn-primary">' + (c ? 'Enregistrer' : 'Créer la collection') + '</button></div></form>');
   },
-  saveCollection(e, id) {
-    e.preventDefault(); const u = me(), name = $('#cName').value.trim(), desc = $('#cDesc').value.trim();
+  async saveCollection(e, id) {
+    e.preventDefault();
+    const name = $('#cName').value.trim(), desc = $('#cDesc').value.trim();
+    if (Store.mode === 'supabase') {
+      try {
+        if (id) { await Store.updateCollection(id, { name, description: desc }); toast('✓ Collection mise à jour'); }
+        else { await Store.createCollection({ name, description: desc }); toast('🗂️ Collection créée'); }
+      } catch (err) { toast('⚠️ ' + err.message); return false; }
+      this.closeModal(); this.renderShell(); this.render(); return false;
+    }
+    const u = me();
     if (id) { const c = DB.collections.find(x => x.id === id); c.name = name; c.desc = desc; toast('✓ Collection mise à jour'); }
     else { DB.collections.unshift({ id: uid(), owner: u.id, name, desc, postIds: [], created: Date.now() }); toast('🗂️ Collection créée'); }
     saveDB(); this.closeModal(); this.renderShell(); this.render(); return false;
@@ -450,11 +779,29 @@ const App = {
     modal('Supprimer la collection ?', '<p style="color:var(--muted);font-size:14px;line-height:1.6;margin-bottom:6px">« ' + esc(c.name) + ' » sera supprimée. Les articles restent disponibles dans la bibliothèque.</p>'
       + '<div class="modal-actions"><button class="btn btn-outline" onclick="App.closeModal()">Annuler</button><button class="btn btn-danger" onclick="App.confirmDeleteCollection(\'' + id + '\')">Supprimer</button></div>');
   },
-  confirmDeleteCollection(id) { DB.collections = DB.collections.filter(c => c.id !== id); if (this.collId === id) this.collId = null; saveDB(); this.closeModal(); this.renderShell(); this.render(); toast('🗑 Collection supprimée'); },
+  async confirmDeleteCollection(id) {
+    if (Store.mode === 'supabase') {
+      try { await Store.deleteCollection(id); } catch (e) { toast('⚠️ ' + e.message); return; }
+    } else { DB.collections = DB.collections.filter(c => c.id !== id); saveDB(); }
+    if (this.collId === id) this.collId = null;
+    this.closeModal(); this.renderShell(); this.render(); toast('🗑 Collection supprimée');
+  },
 
   /* ---------- NOTES ---------- */
-  vNotes() {
+  async vNotes() {
+    if (Store.mode === 'supabase') {
+      let rows = [];
+      try { rows = await Store.listNotes(); } catch (e) { toast('⚠️ ' + e.message); }
+      this._notes = rows;
+      return this.renderNotes(rows.map(n => ({
+        id: n.id, title: n.title, text: n.body, postId: n.article_id ? Number(n.article_id) : null,
+        created: n.created_at
+      })));
+    }
     const u = me(), notes = DB.notes.filter(n => n.owner === u.id).sort((a, b) => b.created - a.created);
+    return this.renderNotes(notes);
+  },
+  renderNotes(notes) {
     return '<div class="section-head"><div><h3>Mes notes</h3><p>' + notes.length + ' note(s) personnelle(s) — vos idées, vos citations, vos questions.</p></div><button class="btn btn-primary btn-sm" style="width:auto" onclick="App.openNoteForm()">+ Nouvelle note</button></div>'
       + (notes.length ? '<div class="grid grid-2">' + notes.map(n => {
         const p = n.postId ? this.postById(n.postId) : null;
@@ -474,24 +821,57 @@ const App = {
       + '<div class="field"><label>Votre note</label><textarea id="nText" required style="min-height:130px" placeholder="Écrivez librement…">' + esc(n ? n.text : '') + '</textarea></div>'
       + '<div class="modal-actions"><button type="button" class="btn btn-outline" onclick="App.closeModal()">Annuler</button><button type="submit" class="btn btn-primary">' + (n ? 'Enregistrer' : 'Créer la note') + '</button></div></form>');
   },
-  saveNote(e, id, postId) {
-    e.preventDefault(); const u = me(), title = $('#nTitle').value.trim(), text = $('#nText').value.trim();
+  async saveNote(e, id, postId) {
+    e.preventDefault();
+    const title = $('#nTitle').value.trim(), text = $('#nText').value.trim();
+    if (Store.mode === 'supabase') {
+      try {
+        if (id) { await Store.updateNote(id, { title, body: text }); toast('✓ Note mise à jour'); }
+        else { await Store.createNote({ title, body: text, articleId: postId }); toast('📝 Note créée'); }
+      } catch (err) { toast('⚠️ ' + err.message); return false; }
+      this.closeModal(); this.renderShell(); this.render(); return false;
+    }
+    const u = me();
     if (id) { const n = DB.notes.find(x => x.id === id); n.title = title; n.text = text; toast('✓ Note mise à jour'); }
     else { DB.notes.unshift({ id: uid(), owner: u.id, postId, title, text, created: Date.now() }); toast('📝 Note créée'); }
     saveDB(); this.closeModal(); this.renderShell(); this.render(); return false;
   },
-  deleteNote(id) { DB.notes = DB.notes.filter(n => n.id !== id); saveDB(); this.renderShell(); this.render(); toast('🗑 Note supprimée'); },
+  async deleteNote(id) {
+    if (Store.mode === 'supabase') {
+      try { await Store.deleteNote(id); } catch (e) { toast('⚠️ ' + e.message); return; }
+    } else { DB.notes = DB.notes.filter(n => n.id !== id); saveDB(); }
+    this.renderShell(); this.render(); toast('🗑 Note supprimée');
+  },
 
   /* ---------- DISCUSSIONS ---------- */
-  vDiscussions() {
+  async vDiscussions() {
+    if (Store.mode === 'supabase') {
+      let rows = [];
+      try { rows = await Store.listDiscussions(); } catch (e) { toast('⚠️ ' + e.message); }
+      this._discs = rows;
+      return this.renderDiscussions(rows.map(d => ({
+        id: d.id, owner: d.user_id, ownerName: d.author_name, title: d.title, body: d.body,
+        date: d.created_at,
+        comments: d.comments.map(c => ({ id: c.id, owner: c.user_id, ownerName: c.author_name,
+                                          text: c.body, date: c.created_at }))
+      })));
+    }
     const discs = [...DB.discussions].sort((a, b) => b.date - a.date);
-    return '<div class="section-head"><div><h3>Discussions</h3><p>Débattre des idées d’Ingeta avec la communauté, partout dans le monde.</p></div><button class="btn btn-primary btn-sm" style="width:auto" onclick="App.openDiscussionForm()">+ Nouvelle discussion</button></div>'
+    return this.renderDiscussions(discs.map(d => ({
+      ...d, ownerName: (DB.users.find(u => u.id === d.owner) || {}).name,
+      comments: (d.comments || []).map(cm => ({ ...cm, ownerName: (DB.users.find(u => u.id === cm.owner) || {}).name }))
+    })));
+  },
+  renderDiscussions(discs) {
+    return '<div class="section-head"><div><h3>Discussions</h3><p>Débattre des idées d’Ingeta avec la communauté, partout dans le monde.'
+      + (Store.mode === 'supabase' ? ' <span class="pill" style="background:rgba(34,197,94,.14);color:#15803d;border-color:#bbf7d0">● temps réel</span>' : '')
+      + '</p></div><button class="btn btn-primary btn-sm" style="width:auto" onclick="App.openDiscussionForm()">+ Nouvelle discussion</button></div>'
       + (discs.length ? discs.map(d => {
-        const owner = DB.users.find(u => u.id === d.owner);
+        const owner = { name: d.ownerName || 'Membre' };
         const nb = (d.comments || []).length;
         return '<div class="disc"><div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start"><div style="flex:1"><h4 onclick="App.openDiscussion(\'' + d.id + '\')" style="cursor:pointer">' + esc(d.title) + '</h4><p>' + esc(d.body) + '</p></div></div>'
           + '<div class="meta" style="margin-top:9px"><span class="av" style="background:var(--blue)">' + esc(initials(owner ? owner.name : '?')) + '</span><span>' + esc(owner ? owner.name : 'Membre') + '</span><span>·</span><span>' + fmtShort(d.date) + '</span><span>·</span><span>💬 ' + nb + ' réponse(s)</span></div>'
-          + (nb ? '<div style="margin-top:11px;padding-top:9px;border-top:1px solid var(--line)">' + d.comments.slice(-2).map(c => { const co = DB.users.find(u => u.id === c.owner); return '<div class="msg"><div class="m-av">' + esc(initials(co ? co.name : '?')) + '</div><div><b>' + esc(co ? co.name : 'Membre') + '</b> <span class="t">' + fmtShort(c.date) + '</span><p>' + esc(c.text) + '</p></div></div>'; }).join('') + '</div>' : '')
+          + (nb ? '<div style="margin-top:11px;padding-top:9px;border-top:1px solid var(--line)">' + d.comments.slice(-2).map(c => { const co = { name: c.ownerName || 'Membre' }; return '<div class="msg"><div class="m-av">' + esc(initials(co.name)) + '</div><div><b>' + esc(co.name) + '</b> <span class="t">' + fmtShort(c.date) + '</span><p>' + esc(c.text) + '</p></div></div>'; }).join('') + '</div>' : '')
           + '<form onsubmit="return App.addComment(event,\'' + d.id + '\')" style="display:flex;gap:7px;margin-top:10px"><input placeholder="Répondre…" style="flex:1;padding:9px 12px;border-radius:9px;border:1.5px solid var(--line);background:var(--paper);color:var(--ink);font-size:13px;outline:none"><button class="btn btn-primary btn-sm" style="width:auto" type="submit">Envoyer</button></form>'
           + (me().role === 'admin' || d.owner === me().id ? '<div class="actions" style="margin-top:8px"><button class="chip-btn" onclick="App.openDiscussionForm(\'' + d.id + '\')">✏️ Modifier</button><button class="chip-btn" style="color:var(--red)" onclick="App.deleteDiscussion(\'' + d.id + '\')">🗑 Supprimer</button></div>' : '')
           + '</div>';
@@ -507,26 +887,54 @@ const App = {
       + '<div class="field"><label>Votre message</label><textarea id="dBody" required placeholder="Développez votre idée…">' + esc(d ? d.body : '') + '</textarea></div>'
       + '<div class="modal-actions"><button type="button" class="btn btn-outline" onclick="App.closeModal()">Annuler</button><button type="submit" class="btn btn-primary">' + (d ? 'Enregistrer' : 'Publier') + '</button></div></form>');
   },
-  saveDiscussion(e, id) {
-    e.preventDefault(); const title = $('#dTitle').value.trim(), body = $('#dBody').value.trim();
+  async saveDiscussion(e, id) {
+    e.preventDefault();
+    const title = $('#dTitle').value.trim(), body = $('#dBody').value.trim();
+    if (Store.mode === 'supabase') {
+      try {
+        if (id) { await Store.updateDiscussion(id, { title, body }); toast('✓ Discussion mise à jour'); }
+        else { await Store.createDiscussion({ title, body }); toast('💬 Discussion publiée'); }
+      } catch (err) { toast('⚠️ ' + err.message); return false; }
+      this.closeModal(); this.renderShell(); this.render(); return false;
+    }
     if (id) { const d = DB.discussions.find(x => x.id === id); d.title = title; d.body = body; toast('✓ Discussion mise à jour'); }
     else { DB.discussions.unshift({ id: uid(), owner: me().id, title, body, comments: [], date: Date.now() }); toast('💬 Discussion publiée'); }
     saveDB(); this.closeModal(); this.renderShell(); this.render(); return false;
   },
-  deleteDiscussion(id) { DB.discussions = DB.discussions.filter(d => d.id !== id); saveDB(); this.renderShell(); this.render(); toast('🗑 Discussion supprimée'); },
-  addComment(e, id) {
-    e.preventDefault(); const input = e.target.querySelector('input'); const text = input.value.trim(); if (!text) return false;
+  async deleteDiscussion(id) {
+    if (Store.mode === 'supabase') {
+      try { await Store.deleteDiscussion(id); } catch (e) { toast('⚠️ ' + e.message); return; }
+    } else { DB.discussions = DB.discussions.filter(d => d.id !== id); saveDB(); }
+    this.renderShell(); this.render(); toast('🗑 Discussion supprimée');
+  },
+  async addComment(e, id) {
+    e.preventDefault();
+    const input = e.target.querySelector('input'); const text = input.value.trim(); if (!text) return false;
+    if (Store.mode === 'supabase') {
+      try { await Store.addComment(id, text); } catch (err) { toast('⚠️ ' + err.message); return false; }
+      input.value = ''; this.render(); toast('💬 Réponse publiée'); return false;
+    }
     const d = DB.discussions.find(x => x.id === id);
     d.comments.push({ id: uid(), owner: me().id, text, date: Date.now() });
     saveDB(); this.render(); toast('💬 Réponse publiée'); return false;
   },
 
   /* ---------- ÉVÉNEMENTS ---------- */
-  vEvents() {
+  async vEvents() {
+    if (Store.mode === 'supabase') {
+      let rows = [];
+      try { rows = await Store.listEvents(); } catch (e) { toast('⚠️ ' + e.message); }
+      this._events = rows;
+      return this.renderEvents(rows, true);
+    }
     const u = me(), evts = [...DB.events].sort((a, b) => new Date(a.date) - new Date(b.date));
+    return this.renderEvents(evts, false);
+  },
+  renderEvents(evts, isSupabase) {
     return '<div class="section-head"><div><h3>Événements</h3><p>Rencontres, cercles de lecture et débats Ingeta — en ligne et sur place.</p></div><button class="btn btn-primary btn-sm" style="width:auto" onclick="App.openEventForm()">+ Nouvel événement</button></div>'
       + (evts.length ? evts.map(e2 => {
-        const going = (DB.rsvped[u.id] || []).includes(e2.id), d = new Date(e2.date);
+        const going = isSupabase ? !!e2.going : (DB.rsvped[me().id] || []).includes(e2.id);
+        const d = new Date(e2.date);
         return '<div class="disc" style="display:flex;gap:14px;flex-wrap:wrap"><div class="cal"><b>' + d.getDate() + '</b><span>' + d.toLocaleDateString('fr-FR', { month: 'short' }) + '</span></div>'
           + '<div style="flex:1;min-width:200px"><h4>' + esc(e2.title) + '</h4><p>' + esc(e2.desc) + '</p><div class="meta" style="margin-top:7px"><span>🕐 ' + esc(e2.time) + '</span><span>·</span><span>📍 ' + esc(e2.place) + '</span><span>·</span><span>' + (e2.rsvps + (going ? 1 : 0)) + ' participant(s)</span></div></div>'
           + '<div style="display:flex;flex-direction:column;gap:6px"><button class="chip-btn ' + (going ? 'on-gold' : '') + '" onclick="App.toggleRsvp(\'' + e2.id + '\')">' + (going ? '✓ Je participe' : 'Je participe') + '</button>'
@@ -534,7 +942,15 @@ const App = {
       }).join('')
         : this.empty('📅', 'Aucun événement', 'Créez votre premier événement : un cercle de lecture, une rencontre avec un auteur, un débat en ligne.', '+ Créer un événement', 'App.openEventForm()'));
   },
-  toggleRsvp(id) {
+  async toggleRsvp(id) {
+    if (Store.mode === 'supabase') {
+      const ev = (this._events || []).find(x => x.id === id);
+      const on = !(ev && ev.going);
+      try { await Store.toggleRsvp(id, on); }
+      catch (e) { toast('⚠️ ' + e.message); return; }
+      toast(on ? '✓ Votre place est réservée' : 'Inscription annulée');
+      this.render(); return;
+    }
     const u = me(); DB.rsvped[u.id] = DB.rsvped[u.id] || []; const i = DB.rsvped[u.id].indexOf(id);
     if (i >= 0) { DB.rsvped[u.id].splice(i, 1); toast('Inscription annulée'); } else { DB.rsvped[u.id].push(id); toast('✓ Votre place est réservée'); }
     saveDB(); this.render();
@@ -550,19 +966,32 @@ const App = {
       + '<div class="field"><label>Lieu</label><input id="ePlace" required value="' + esc(e2 ? e2.place : '') + '" placeholder="En ligne · Zoom"></div>'
       + '<div class="modal-actions"><button type="button" class="btn btn-outline" onclick="App.closeModal()">Annuler</button><button type="submit" class="btn btn-primary">' + (e2 ? 'Enregistrer' : 'Créer') + '</button></div></form>');
   },
-  saveEvent(e, id) {
+  async saveEvent(e, id) {
     e.preventDefault();
-    const o = { title: $('#eTitle').value.trim(), desc: $('#eDesc').value.trim(), date: $('#eDate').value, time: $('#eTime').value.trim(), place: $('#ePlace').value.trim() };
+    const o = { title: $('#eTitle').value.trim(), desc: $('#eDesc').value.trim(),
+                date: $('#eDate').value, time: $('#eTime').value.trim(), place: $('#ePlace').value.trim() };
+    if (Store.mode === 'supabase') {
+      try {
+        if (id) { await Store.updateEvent(id, o); toast('✓ Événement mis à jour'); }
+        else { await Store.createEvent(o); toast('📅 Événement créé'); }
+      } catch (err) { toast('⚠️ ' + err.message); return false; }
+      this.closeModal(); this.render(); return false;
+    }
     if (id) { Object.assign(DB.events.find(x => x.id === id), o); toast('✓ Événement mis à jour'); }
     else { DB.events.unshift({ id: uid(), ...o, rsvps: 0 }); toast('📅 Événement créé'); }
     saveDB(); this.closeModal(); this.render(); return false;
   },
-  deleteEvent(id) { DB.events = DB.events.filter(e => e.id !== id); saveDB(); this.render(); toast('🗑 Événement supprimé'); },
+  async deleteEvent(id) {
+    if (Store.mode === 'supabase') {
+      try { await Store.deleteEvent(id); } catch (e) { toast('⚠️ ' + e.message); return; }
+    } else { DB.events = DB.events.filter(e => e.id !== id); saveDB(); }
+    this.render(); toast('🗑 Événement supprimé');
+  },
 
   /* ---------- LECTEUR D'ARTICLE ---------- */
   async openArticle(id, refreshOnly) {
     const p = this.postById(id); if (!p) { toast('⚠️ Article indisponible'); return; }
-    const u = me(), saved = (DB.saved[u.id] || []).includes(id), liked = (DB.liked[u.id] || []).includes(id);
+    const saved = this.isSaved(id), liked = this.isLiked(id);
     const cats = catsOf(p);
     if (!refreshOnly) {
       this.readerPost = p;
@@ -592,13 +1021,26 @@ const App = {
     rd.onscroll = () => {
       const pct = Math.min(99, Math.round((rd.scrollTop / Math.max(1, rd.scrollHeight - rd.clientHeight)) * 100));
       bar.style.width = pct + '%';
+      if (Store.mode === 'supabase') {
+        if (pct > (Store.progress[id] || 0)) {
+          clearTimeout(this._pgT);
+          this._pgT = setTimeout(() => Store.saveProgress(id, pct), 900);
+        }
+        return;
+      }
       DB.progress[u.id] = DB.progress[u.id] || {};
       if (pct > (DB.progress[u.id][id] || 0)) { DB.progress[u.id][id] = pct; clearTimeout(this._pgT); this._pgT = setTimeout(saveDB, 600); }
     };
     // contenu complet : chargé à la demande depuis le fichier de 22 Mo
     const fallback = '<p>' + esc(strip(p.excerpt)) + '</p><p><a href="' + esc(p.link) + '" target="_blank" rel="noopener">Lire l’article complet sur ingeta.com →</a></p>';
     try {
-      const full = await fetchFullArticle(id);
+      let full = null;
+      if (Store.mode === 'supabase') {
+        const row = await Store.getArticle(id);
+        full = row && row.content;
+      } else {
+        full = await fetchFullArticle(id);
+      }
       if (this.readerPost && this.readerPost.id === id) $('#rdBody').innerHTML = full ? sanitize(full) : fallback;
     } catch (e) {
       if (this.readerPost && this.readerPost.id === id) $('#rdBody').innerHTML = fallback;
@@ -631,9 +1073,18 @@ const App = {
       + (postId ? '' : '<div class="field"><label>Articles à ajouter</label><div style="max-height:260px;overflow:auto;border:1.5px solid var(--line);border-radius:10px;padding:6px">' + DATA.posts.slice(0, 60).map(p => '<label style="display:flex;gap:9px;align-items:flex-start;padding:7px;border-radius:7px;font-size:12.5px;line-height:1.4;cursor:pointer"><input type="checkbox" name="pc" value="' + p.id + '" style="margin-top:3px;flex-shrink:0">' + esc(strip(p.title)) + '</label>').join('') + '</div><p style="font-size:11px;color:var(--muted);margin-top:6px">60 articles les plus récents affichés — utilisez la recherche pour les autres.</p></div>')
       + '<div class="modal-actions"><button type="button" class="btn btn-outline" onclick="App.closeModal()">Annuler</button><button type="submit" class="btn btn-primary">Ajouter</button></div></form>');
   },
-  addToCollection(e, postId, collId) {
+  async addToCollection(e, postId, collId) {
     e.preventDefault();
-    const cid = collId || $('#acColl').value, c = DB.collections.find(x => x.id === cid); if (!c) return false;
+    const cid = collId || $('#acColl').value;
+    if (Store.mode === 'supabase') {
+      const ids = postId ? [postId] : [...e.target.querySelectorAll('input[name=pc]:checked')].map(i => Number(i.value));
+      try { await Store.addToCollection(cid, ids); }
+      catch (err) { toast('⚠️ ' + err.message); return false; }
+      this.closeModal(); this.renderShell(); this.render();
+      toast('🗂️ ' + ids.length + ' article(s) ajouté(s)');
+      return false;
+    }
+    const c = DB.collections.find(x => x.id === cid); if (!c) return false;
     if (postId) { if (!c.postIds.includes(postId)) c.postIds.push(postId); toast('🗂️ Ajouté à « ' + c.name + ' »'); }
     else {
       const ids = [...e.target.querySelectorAll('input[name=pc]:checked')].map(i => Number(i.value));
@@ -642,23 +1093,43 @@ const App = {
     }
     saveDB(); this.closeModal(); this.render(); return false;
   },
-  removeFromCollection(cid, postId) {
+  async removeFromCollection(cid, postId) {
+    if (Store.mode === 'supabase') {
+      try { await Store.removeFromCollection(cid, postId); } catch (e) { toast('⚠️ ' + e.message); return; }
+      this.render(); toast('Retiré de la collection'); return;
+    }
     const c = DB.collections.find(x => x.id === cid); c.postIds = c.postIds.filter(id => id !== postId);
     saveDB(); this.render(); toast('Retiré de la collection');
   },
 
   /* ---------- ADMIN ---------- */
-  vAdmin() {
+  async vAdmin() {
     const u = me();
-    if (u.role !== 'admin') return this.empty('🔒', 'Accès réservé', 'Cette espace est destiné aux administrateurs. Connectez-vous avec admin@ingeta.com / admin1234.', 'Se reconnecter', 'App.logout()');
+    const hint = Store.mode === 'supabase'
+      ? 'Cet espace est réservé aux administrateurs. Accordez-vous le rôle admin dans Supabase (voir README, section « Devenir administrateur »).'
+      : 'Cet espace est destiné aux administrateurs. Connectez-vous avec admin@ingeta.com / admin1234.';
+    if (u.role !== 'admin') return this.empty('🔒', 'Accès réservé', hint, 'Se déconnecter', 'App.logout()');
+    if (Store.mode === 'supabase') {
+      let c = { articles: SB_TOTAL, notes: 0, collections: 0 };
+      try { c = await Store.dashboardCounts(); } catch (e) {}
+      const recentSb = DATA.posts.slice(0, 40);
+      return this.renderAdmin(recentSb, c.articles, c);
+    }
     const recent = [...DATA.posts].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 40);
+    return this.renderAdmin(recent, DATA.posts.length, { notes: 0, collections: 0 });
+  },
+  renderAdmin(recent, totalArticles, counts) {
     return '<div class="section-head"><div><h3>Gestion du contenu</h3><p>Contenus synchronisés depuis ingeta.com' + (DATA.synced ? ' le ' + fmtDate(DATA.synced) : '') + '.</p></div>'
       + '<button class="btn btn-primary btn-sm" style="width:auto" onclick="App.syncNotice()">🔄 Resynchroniser</button></div>'
-      + '<div class="stat-grid"><div class="stat"><div class="num">' + DATA.posts.length.toLocaleString('fr-FR') + '</div><div class="lbl">Articles</div></div>'
+      + '<div class="stat-grid"><div class="stat"><div class="num">' + totalArticles.toLocaleString('fr-FR') + '</div><div class="lbl">Articles</div></div>'
       + '<div class="stat"><div class="num">' + DATA.categories.length + '</div><div class="lbl">Thématiques</div></div>'
       + '<div class="stat"><div class="num">' + PODS.length + '</div><div class="lbl">Épisodes</div></div>'
-      + '<div class="stat"><div class="num">' + DB.users.length + '</div><div class="lbl">Membres</div></div></div>'
-      + '<div class="panel" style="margin-bottom:16px"><h4>Source des contenus</h4><p style="font-size:13px;color:var(--muted);line-height:1.7">Les articles et podcasts proviennent de l’API publique WordPress d’<a href="https://www.ingeta.com" target="_blank" rel="noopener">ingeta.com</a> (wp-json). Logo, polices (Hind Siliguri, Poppins, Playfair Display) et palette (#0080FF, #D0021B, #FAB901, #740D11) sont ceux du site officiel.</p></div>'
+      + '<div class="stat"><div class="num">' + (Store.mode === 'supabase' ? (counts.notes || 0) + (counts.collections || 0) : DB.users.length) + '</div><div class="lbl">' + (Store.mode === 'supabase' ? 'Éléments personnels' : 'Membres') + '</div></div></div>'
+      + '<div class="panel" style="margin-bottom:16px"><h4>Source des contenus</h4><p style="font-size:13px;color:var(--muted);line-height:1.7">Les articles et podcasts proviennent de l’API publique WordPress d’<a href="https://www.ingeta.com" target="_blank" rel="noopener">ingeta.com</a> (wp-json). Logo, polices (Hind Siliguri, Poppins, Playfair Display) et palette (#0080FF, #D0021B, #FAB901, #740D11) sont ceux du site officiel.<br><br>'
+      + (Store.mode === 'supabase'
+          ? '<b style="color:var(--ink)">Base de données :</b> Supabase (PostgreSQL). Articles, thématiques, podcasts, membres et bibliothèques personnelles sont stockés côté serveur et synchronisés entre appareils. Sécurité par Row Level Security.'
+          : '<b style="color:var(--ink)">Mode local :</b> les contenus éditoriaux sont des fichiers statiques ; les données personnelles restent dans ce navigateur. Renseignez <code>config.js</code> pour activer la synchronisation Supabase.')
+      + '</p></div>'
       + '<div class="table-wrap"><table class="table"><thead><tr><th>Titre</th><th>Thématiques</th><th>Date</th><th>Actions</th></tr></thead><tbody>'
       + recent.map(p => '<tr><td><b style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-width:420px">' + esc(strip(p.title)) + '</b></td><td style="font-size:11.5px;color:var(--muted)">' + esc(catsOf(p)[0]) + '</td><td style="white-space:nowrap;font-size:12px">' + fmtShort(p.date) + '</td><td style="white-space:nowrap"><button class="pill" onclick="App.openArticle(' + p.id + ')">👁</button> <a class="pill" href="' + esc(p.link) + '" target="_blank" rel="noopener">↗</a></td></tr>').join('')
       + '</tbody></table></div><p style="font-size:12px;color:var(--muted)">Les 40 publications les plus récentes. Les ' + (DATA.posts.length - recent.length).toLocaleString('fr-FR') + ' autres sont accessibles depuis la bibliothèque.</p>';
@@ -681,11 +1152,66 @@ const App = {
       + '<div class="card" style="padding:22px;cursor:default"><h4 style="font-family:var(--serif);font-size:19px;margin-bottom:12px">🔔 Préférences</h4>'
       + [['Mode sombre', 'Interface sombre pour lire la nuit', this.dark, 'toggleDark'], ['Notifications', 'Nouveaux articles et podcasts', true, ''], ['Lecture automatique', 'Enchaîner les podcasts', false, '']].map(p => '<div style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)"><div style="flex:1"><b style="font-size:13.5px">' + p[0] + '</b><div style="color:var(--muted);font-size:12px">' + p[1] + '</div></div><button class="toggle ' + (p[2] ? 'on' : '') + '" onclick="' + (p[3] ? 'App.' + p[3] + '()' : 'App.togglePref(this)') + '"></button></div>').join('')
       + '</div></div></div>'
-      + '<div class="card" style="padding:22px;margin-top:14px;cursor:default"><h4 style="font-family:var(--serif);font-size:19px;margin-bottom:9px">✦ À propos de cette application</h4><p style="color:var(--muted);line-height:1.7;font-size:13.5px">Application non officielle construite autour des contenus publics d’<a href="https://www.ingeta.com" target="_blank" rel="noopener">ingeta.com</a> — « Idées & ressources pour réinventer le Congo ». ' + DATA.posts.length.toLocaleString('fr-FR') + ' articles et ' + PODS.length + ' épisodes synchronisés. Logo, couleurs et typographies appartiennent à Ingeta. Aucun paywall : le savoir qui libère un peuple ne se vend pas.</p></div>';
+      + installCard() + '<div class="card" style="padding:22px;margin-top:14px;cursor:default"><h4 style="font-family:var(--serif);font-size:19px;margin-bottom:9px">✦ À propos de cette application</h4><p style="color:var(--muted);line-height:1.7;font-size:13.5px">Application non officielle construite autour des contenus publics d’<a href="https://www.ingeta.com" target="_blank" rel="noopener">ingeta.com</a> — « Idées & ressources pour réinventer le Congo ». ' + DATA.posts.length.toLocaleString('fr-FR') + ' articles et ' + PODS.length + ' épisodes synchronisés. Logo, couleurs et typographies appartiennent à Ingeta. Aucun paywall : le savoir qui libère un peuple ne se vend pas.</p></div>';
   },
   togglePref(el) { el.classList.toggle('on'); toast('✓ Préférence enregistrée'); },
-  setRegion(r) { const u = me(); u.region = r; saveDB(); this.renderShell(); this.render(); toast('🌍 Région : ' + r); },
-  saveProfile(e) { e.preventDefault(); const u = me(); u.name = $('#pName').value.trim() || u.name; u.region = $('#pRegion').value; saveDB(); this.renderShell(); this.render(); toast('✓ Profil mis à jour'); return false; },
+
+  /* Installation sur l'écran d'accueil, avec instructions adaptées au navigateur. */
+  async installApp() {
+    if (_installPrompt) {
+      _installPrompt.prompt();
+      const res = await _installPrompt.userChoice;
+      if (res && res.outcome === 'accepted') toast('✓ Installation lancée');
+      _installPrompt = null; this._installable = false;
+      this.render(); return;
+    }
+    const ua = navigator.userAgent;
+    const iOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const firefox = /Firefox|FxiOS/i.test(ua);
+    let txt;
+    if (iOS) {
+      txt = '<b>Sur iPhone / iPad (Safari)</b><p style="color:var(--muted);font-size:13px;line-height:1.7;margin-top:7px">'
+        + '1. Touchez le bouton <b>Partager</b> (carré avec une flèche).<br>'
+        + '2. Faites défiler et choisissez <b>« Sur l’écran d’accueil »</b>.<br>'
+        + '3. Validez avec <b>Ajouter</b>. L’icône Ingeta apparaît comme une application.</p>';
+    } else if (firefox) {
+      txt = '<b>Sur Firefox Android</b><p style="color:var(--muted);font-size:13px;line-height:1.7;margin-top:7px">'
+        + 'Menu <b>⋮</b> → <b>« Installer »</b> ou <b>« Ajouter à l’écran d’accueil »</b>.</p>';
+    } else {
+      txt = '<b>Depuis Chrome ou Edge</b><p style="color:var(--muted);font-size:13px;line-height:1.7;margin-top:7px">'
+        + 'Menu <b>⋮</b> → <b>« Installer l’application »</b>, ou l’icône d’installation dans la barre d’adresse.<br>'
+        + 'Sur ordinateur, la même entrée figure dans le menu du navigateur.</p>';
+    }
+    modal('📲 Installer Ingeta', txt
+      + '<p style="color:var(--muted);font-size:12.5px;margin-top:12px;line-height:1.6;border-top:1px solid var(--line);padding-top:11px">'
+      + 'Une fois installée, l’application s’ouvre en plein écran, sans barre d’adresse, et les articles déjà lus restent accessibles hors connexion.</p>'
+      + '<button class="btn btn-primary" style="width:100%;margin-top:12px" onclick="App.closeModal()">J’ai compris</button>');
+  },
+
+  /* Diagnostic affiché dans Paramètres : utile pour vérifier un téléphone. */
+  installStatus() {
+    const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+    if (standalone) return { label: 'Installée — mode application', ok: true };
+    if (this._installable) return { label: 'Prête à installer', ok: true };
+    return { label: 'Navigateur (non installée)', ok: false };
+  },
+  async setRegion(r) {
+    if (Store.mode === 'supabase') {
+      try { await Store.updateProfile({ region: r }); } catch (e) { toast('⚠️ ' + e.message); return; }
+    } else { const u = me(); u.region = r; saveDB(); }
+    this.renderShell(); this.render(); toast('🌍 Région : ' + r);
+  },
+  async saveProfile(e) {
+    e.preventDefault();
+    const name = $('#pName').value.trim(), region = $('#pRegion').value;
+    if (Store.mode === 'supabase') {
+      try { await Store.updateProfile({ fullName: name, region }); }
+      catch (err) { toast('⚠️ ' + err.message); return false; }
+    } else {
+      const u = me(); u.name = name || u.name; u.region = region; saveDB();
+    }
+    this.renderShell(); this.render(); toast('✓ Profil mis à jour'); return false;
+  },
 
   /* ---------- MODAL & TOAST ---------- */
   closeModal() { if ($('#modalRoot')) $('#modalRoot').innerHTML = ''; }
@@ -696,6 +1222,24 @@ function modal(title, body) {
   let r = $('#modalRoot'); if (!r) { r = document.createElement('div'); r.id = 'modalRoot'; document.body.appendChild(r); }
   r.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)App.closeModal()"><div class="modal" role="dialog" aria-modal="true"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px"><h3>' + title + '</h3><button class="icon-btn" style="width:31px;height:31px;border:none;background:var(--cream);font-size:13px" onclick="App.closeModal()">✕</button></div>' + body + '</div></div>';
 }
+/* Carte d'installation affichée dans Paramètres (PWA). */
+function installCard() {
+  const st = App.installStatus();
+  const badge = st.ok
+    ? '<span class="pill" style="background:#e6f7ee;color:#0a7a48;font-size:10.5px">✓ ' + st.label + '</span>'
+    : '<span class="pill" style="font-size:10.5px">' + st.label + '</span>';
+  return '<div class="card" style="padding:22px;margin-top:14px;cursor:default">'
+    + '<h4 style="font-family:var(--serif);font-size:19px;margin-bottom:9px">📲 Application mobile ' + badge + '</h4>'
+    + '<p style="color:var(--muted);line-height:1.7;font-size:13.5px;margin-bottom:13px">'
+    + 'Ingeta s’installe comme une application : icône sur l’écran d’accueil, ouverture en plein écran, '
+    + 'et lecture hors connexion des articles déjà consultés. Aucun store, aucune mise à jour à télécharger.</p>'
+    + '<button class="btn btn-primary" onclick="App.installApp()">📲 Installer sur cet appareil</button>'
+    + '<p style="color:var(--muted);font-size:12px;margin-top:11px;line-height:1.6">'
+    + 'Fonctionne sur Android, iPhone, iPad et ordinateur. Vos favoris et notes restent synchronisés '
+    + (Store.mode === 'supabase' ? 'via votre compte Supabase.' : 'dans ce navigateur.') + '</p>'
+    + '</div>';
+}
+
 let toastTimer;
 function toast(msg) {
   let t = $('#toast'); if (!t) { t = document.createElement('div'); t.id = 'toast'; t.className = 'toast'; document.body.appendChild(t); }
@@ -739,7 +1283,50 @@ function sanitize(html) {
 }
 
 /* ---------- DÉMARRAGE ---------- */
+/* ---------- APPLICATION INSTALLABLE (PWA) ---------- */
+
+/* Le hash reflète la vue courante : liens partageables et raccourcis d'écran d'accueil. */
+window.addEventListener('hashchange', () => {
+  const raw = (location.hash || '').replace('#', '');
+  const publicViews = ['accueil', 'magazine', 'explorer', 'audio', 'bibliotheque', 'recherche'];
+  /* Articles partageables : #article-<id> */
+  if (raw.startsWith('article-')) { Pub.show().then(() => Pub.open(Number(raw.slice(8)))); return; }
+  if (publicViews.includes(raw)) {
+    if ($('#publicApp').classList.contains('hidden')) Pub.show(); else { Pub.view = raw; Pub.query = ''; Pub.theme = null; Pub.render(); }
+    return;
+  }
+  if (raw === 'connexion' || raw === 'inscription') { if ($('#authScreen').classList.contains('hidden')) App.openAuth(raw === 'inscription' ? 'signup' : 'login'); return; }
+  if (raw && raw !== App.view && $('#app') && !$('#app').classList.contains('hidden')) App.go(raw);
+});
+
+/* Android / Chrome : capture de la demande d'installation native. */
+let _installPrompt = null;
+window.addEventListener('beforeinstallprompt', (ev) => {
+  ev.preventDefault();
+  _installPrompt = ev;
+  App._installable = true;
+  if (App.view === 'settings') App.render();
+});
+window.addEventListener('appinstalled', () => {
+  _installPrompt = null; App._installable = false;
+  toast('✓ Ingeta est installé sur votre écran d’accueil');
+});
+
+/* Enregistrement du service worker : lecture hors ligne des articles déjà ouverts. */
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch((e) => console.warn('Service worker non enregistré :', e.message));
+  });
+}
+
 window.addEventListener('DOMContentLoaded', () => { App.boot(); });
+
+/* Les gestionnaires étant désormais asynchrones, on évite les échecs silencieux. */
+window.addEventListener('unhandledrejection', (ev) => {
+  console.error('Promesse non gérée', ev.reason);
+  toast('⚠️ ' + (ev.reason && ev.reason.message ? ev.reason.message : 'Une opération a échoué'));
+  ev.preventDefault();
+});
 document.addEventListener('click', e => {
   if (!e.target.closest('#notifPanel') && !e.target.closest('[onclick*="toggleNotifs"]')) {
     if (App.notifOpen) { App.notifOpen = false; $('#notifPanel').classList.add('hidden'); }

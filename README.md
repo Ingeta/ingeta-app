@@ -4,9 +4,67 @@ Application complète (mobile-first, responsive) construite autour de **l'intég
 
 Tous les contenus sont **réels** : ils proviennent de l'API WordPress publique du site, synchronisés le **22 novembre 2026**.
 
-> **Démo en ligne** — une fois publié sur GitHub Pages : `https://VOTRE-COMPTE.github.io/VOTRE-DEPOT/`
+> **Démo en ligne** : <https://ingeta.github.io/ingeta-app/>
 
 ---
+
+## Deux modes, un seul code
+
+L'application fonctionne de deux façons, sans modification du code :
+
+| | **Mode local** (par défaut) | **Mode Supabase** |
+|---|---|---|
+| Configuration | aucune | 2 clés dans `config.js` |
+| Authentification | simulée, stockée dans le navigateur | **réelle** (mots de passe hachés) |
+| Données personnelles | dans le navigateur, un seul appareil | **synchronisées** entre appareils |
+| Discussions | locales | **réelles, partagées, en temps réel** |
+| Recherche et pagination | dans le navigateur | **côté serveur** (PostgreSQL) |
+
+Le badge dans la barre latérale indique le mode actif : « Mode local » ou « ● Synchronisé ».
+
+**Pour activer Supabase : suivez [`supabase/README.md`](supabase/README.md)** — 15 minutes, gratuit, sans carte bancaire.
+
+## Accès libre : le portail public
+
+L'application s'ouvre sur un **portail de lecture** — aucune inscription, aucun mot de passe. Tout le contenu éditorial est immédiatement accessible, dans l'esprit d'une grande revue :
+
+| Onglet | Contenu |
+|---|---|
+| **À la une** | article du jour, file d'articles, thématiques en accès rapide |
+| **Magazine** | file complète, pagination, enregistrement |
+| **Explorer** | 80 thématiques, filtre par sujet |
+| **Audio** | les 20 épisodes de podcast, lecture immédiate |
+| **Bibliothèque** | articles enregistrés (compte requis) |
+
+La barre de recherche interroge tout le catalogue (2 677 articles) **sans compte**, en local comme sur Supabase.
+
+**Le compte n'est pas un péage, c'est un service.** La connexion n'apparaît que lorsqu'elle apporte quelque chose : enregistrer un article, prendre une note, créer une collection, publier une discussion, retrouver ses lectures sur un autre appareil. Un visiteur qui clique sur « Enregistrer » est invité à créer un compte — il n'est jamais bloqué en lecture.
+
+Chaque article possède une adresse partageable : `index.html#article-18585` ouvre directement le texte intégral.
+
+**Architecture** : le portail vit dans `public.js` (objet `Pub`), les styles dans la section *PORTAIL PUBLIC* de `app.css`. En mode Supabase, la lecture passe par `Store.publicClient()` : un client anonyme, sans session, qui s'appuie sur les politiques RLS de lecture publique.
+
+---
+
+## Sur téléphone
+
+L'application est une **PWA** : elle s'installe sur l'écran d'accueil, s'ouvre en plein écran et permet de lire hors connexion les articles déjà consultés. Pas de store, pas de compte développeur.
+
+- **Android** : ouvrir le site depuis Chrome → menu **⋮** → *Installer l'application*
+- **iPhone / iPad** : depuis **Safari** → *Partager* → *Sur l'écran d'accueil*
+
+Le détail des méthodes de test (PWA, tunnel public, réseau local) et les raisons pour lesquelles Expo Go ne s'applique pas ici sont dans **[`supabase/TESTER-SUR-TELEPHONE.md`](supabase/TESTER-SUR-TELEPHONE.md)**.
+
+---
+
+## PWA
+
+| Fichier | Rôle |
+|---|---|
+| `manifest.webmanifest` | nom, icônes, couleurs, raccourcis d'appui long |
+| `sw.js` | service worker : socle hors ligne, contenus en *stale-while-revalidate*, appels Supabase jamais mis en cache |
+
+L'état réel est visible dans **Paramètres → 📲 Application mobile**.
 
 ## Publier sur GitHub Pages (recommandé)
 
@@ -139,6 +197,15 @@ ingeta-app/
 ├── content/
 │   └── shard-00…39.json    texte intégral, chargé à l'ouverture d'un article (~470 Ko/fichier)
 ├── podcasts.json           20 épisodes réels
+├── manifest.webmanifest    installation sur l'écran d'accueil
+├── sw.js                   service worker (hors ligne)
+├── config.js               clés Supabase (vides = mode local)
+├── store.js                couche de données (Supabase ou local)
+├── vendor/supabase.js      client Supabase embarqué
+├── supabase/
+│   ├── schema.sql          tables, sécurité RLS, triggers, index
+│   ├── seed_content.py     chargement des 2 677 articles dans la base
+│   └── README.md           guide de déploiement pas à pas
 ├── sync_ingeta.py          script de resynchronisation
 ├── .nojekyll               nécessaire pour GitHub Pages
 ├── .github/workflows/      resynchronisation automatique hebdomadaire
@@ -165,7 +232,22 @@ Le script récupère les nouveaux articles, catégories, images et épisodes, pu
 
 ## Persistance
 
-Les données personnelles (compte, favoris, notes, collections, discussions, événements, progression de lecture, thème) sont stockées dans le `localStorage` du navigateur sous les clés `ingeta_app_v3` et `ingeta_session_v3`. Elles survivent à la fermeture de l'application, sur l'appareil.
+**Mode local** — les données personnelles (compte, favoris, notes, collections, discussions, événements, progression de lecture, thème) sont stockées dans le `localStorage` sous les clés `ingeta_app_v3` et `ingeta_session_v3`. Elles survivent à la fermeture de l'application, sur l'appareil uniquement.
+
+**Mode Supabase** — les données vivent en PostgreSQL et suivent l'utilisateur d'un appareil à l'autre. La session Supabase est conservée dans le stockage local du navigateur et rafraîchie automatiquement. La bibliothèque locale n'est plus utilisée, sauf si les clés sont retirées de `config.js` (retour au mode local).
+
+---
+
+## Sécurité
+
+En mode Supabase, la sécurité repose sur les **politiques Row Level Security** de PostgreSQL, pas sur le code client :
+
+- un utilisateur ne lit et ne modifie que ses propres favoris, notes, collections et progression ;
+- les discussions et commentaires sont publics en lecture, modifiables par leur auteur ;
+- le contenu éditorial est en lecture seule pour les membres, en écriture pour les `admin` ;
+- supprimer un compte efface en cascade toutes ses données personnelles.
+
+La clé *anon* présente dans `config.js` est **conçue pour être publique**. Ne diffusez en revanche jamais la clé *service_role*.
 
 ---
 
